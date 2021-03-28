@@ -1,0 +1,218 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Excution order:1. create the role for lambda 2. create the KMS and assign permission for the lambda role 3. run the cloudformatoin command runner to get the encrypt key 4. using Fn::GetAtt: to get the encrypted key and place in the lambda function code 5. create lambda function 6. create cloudwatch rule",
+    "Parameters": {
+        "RecurringScheduleCron": {
+            "Description": "Cron expression for scheduling the Security Hub summary email. Default: Every Monday 8:00 AM GMT. Example: Every Friday 9:00 AM GMT: cron(0 9 ? * 6 *)",
+            "Default": "cron(0 8 ? * 2 *)",
+            "Type": "String"
+        },
+        "SentinelKeyARN":{
+            "Description": "The ARN Sentinel Secret stored in the AWS secrets manager",
+            "Type": "String",
+            "AllowedPattern": "^arn:aws:secretsmanager:[a-zA-Z0-9\\-\\:]+"
+        }
+        },
+    "Metadata": {
+        "AWS::CloudFormation::Interface": {
+            "ParameterGroups": [
+                {
+                    "Label": {
+                        "default": "Parameters"
+                    },
+                    "Parameters": [
+                        "RecurringScheduleCron",
+                        "SentinelKeyARN"
+                    ]
+                }
+            ],
+            "ParameterLabels" : {
+                "RecurringScheduleCron": {"default": "CloudWatch Cron Expression"},
+                "SentinelKeyARN": {"default": "ARN of Sentinel Key stored in secrets manager"}
+        }
+    }},
+    "Resources" : {
+        "cloudWatchTriggerSecurityHubLambdaDaily": {
+            "Type": "AWS::Events::Rule",
+            "Properties": {
+                "Name": "cloudWatchTriggerSecurityHubLambdaDaily",
+                "Description": "Triggers the Recurring Security Hub summary email",
+                "ScheduleExpression": {"Ref": "RecurringScheduleCron"},
+                "Targets": [
+                    {
+                        "Arn": {
+                            "Fn::GetAtt": [
+                                "lambdaSendSecurityHubDaily",
+                                "Arn"
+                            ]
+                        },
+                        "Id": "1"
+                    }
+                ]
+            }
+        },
+        "cloudWatchGuarddutyTriggerLambda": {
+            "Type": "AWS::Events::Rule",
+            "Properties": {
+                "Name": "cloudWatchGuarddutyTriggerLambda",
+                "Description": "When GuardDuty has finding, trigger lambda function",
+                "EventPattern":	{
+                  "source": [
+                    "aws.guardduty"
+                  ]
+                },
+                "Targets": [
+                    {
+                        "Arn": {
+                            "Fn::GetAtt": [
+                                "lambdaSendGuardDutyFindingToSentinel",
+                                "Arn"
+                            ]
+                        },
+                        "Id": "1"
+                    }
+                ]
+            }
+        },
+        "permissionCloudWatchSchedule": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "Action": "lambda:InvokeFunction",
+                "FunctionName": {
+                    "Fn::GetAtt": [
+                        "lambdaSendSecurityHubDaily",
+                        "Arn"
+                    ]
+                },
+                "Principal": "events.amazonaws.com",
+                "SourceArn": {
+                    "Fn::GetAtt": [
+                        "cloudWatchTriggerSecurityHubLambdaDaily",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+        "permissionCloudWatchTriggerLambda": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "Action": "lambda:InvokeFunction",
+                "FunctionName": {
+                    "Fn::GetAtt": [
+                        "lambdaSendGuardDutyFindingToSentinel",
+                        "Arn"
+                    ]
+                },
+                "Principal": "events.amazonaws.com",
+                "SourceArn": {
+                    "Fn::GetAtt": [
+                        "cloudWatchGuarddutyTriggerLambda",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+        "RoleLambdaForSentinel": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+              "RoleName":"RoleLambdaForSentinel",
+              "AssumeRolePolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"Service": ["lambda.amazonaws.com"]},
+                    "Action": ["sts:AssumeRole"]
+                }]
+              },
+               "Policies": [{
+                "PolicyName": "getSentinelKey",
+                "PolicyDocument": {
+                  "Version": "2012-10-17",
+                  "Statement": [{
+                        "Effect": "Allow",
+                        "Action": [
+                            "secretsmanager:GetResourcePolicy",
+                            "secretsmanager:GetSecretValue",
+                            "secretsmanager:DescribeSecret",
+                            "secretsmanager:ListSecretVersionIds"
+                        ],
+                        "Resource": "arn:aws:secretsmanager:ap-northeast-1:697172517517:secret:MyTestDatabaseSecret-YH30Bm"
+                  }
+                ]
+                }
+              }],
+              "ManagedPolicyArns":[
+                  "arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess"
+              ]
+            }
+        },
+        "lambdaSendSecurityHubDaily": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": [
+                            "\n",
+                            [
+                              "import json", 
+                              {"Fn::Join":["", ["keyArn='",{"Ref": "SentinelKeyARN"}, "'"]]},
+                              "def lambda_handler(event, context):", 
+                              "    client = boto3.client('secretsmanager')",
+                              "    response = client.get_secret_value(SecretId='MyTestDatabaseSecret')",
+                              "    return {",     
+                              "    'statusCode': 200,",         
+                              "    'body': json.dumps(response['SecretString'])",         
+                              "    }"
+                            ]
+                        ]
+                    }
+                },
+                "FunctionName":"lambdaSendSecurityHubDaily",
+                "Handler": "index.lambda_handler",
+                "MemorySize": 256,
+                "Runtime": "python3.7",
+                "Timeout": "300",
+                "Role": {
+                    "Fn::GetAtt": [
+                        "RoleLambdaForSentinel",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+        "lambdaSendGuardDutyFindingToSentinel": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": [
+                            "\n",
+                            [
+                              "import json", 
+                              {"Fn::Join":["", ["keyArn='",{"Ref": "SentinelKeyARN"}, "'"]]},
+                              "def lambda_handler(event, context):", 
+                              "    client = boto3.client('secretsmanager')",
+                              "    response = client.get_secret_value(SecretId='MyTestDatabaseSecret')",
+                              "    return {",     
+                              "    'statusCode': 200,",         
+                              "    'body': json.dumps(response['SecretString'])",         
+                              "    }"
+                            ]
+                        ]
+                    }
+                },
+                "FunctionName":"lambdaSendGuardDutyFindingToSentinel",
+                "Handler": "index.lambda_handler",
+                "MemorySize": 256,
+                "Runtime": "python3.7",
+                "Timeout": "300",
+                "Role": {
+                    "Fn::GetAtt": [
+                        "RoleLambdaForSentinel",
+                        "Arn"
+                    ]
+                }
+            }
+        }
+    }
+}
