@@ -1,18 +1,29 @@
 {
     "AWSTemplateFormatVersion": "2010-09-09",
-    "Description": "Excution order:1. create the role for lambda 2. create the KMS and assign permission for the lambda role 3. run the cloudformatoin command runner to get the encrypt key 4. using Fn::GetAtt: to get the encrypted key and place in the lambda function code 5. create lambda function 6. create cloudwatch rule",
+    "Description": "creat 2 lambda that send GuardDuty and Security Hub finding to Sentinel. You need to have Sentinel workspace and key encrypted in AWS secrets manager first. Then retrieve the arn of the secret as the parameter",
     "Parameters": {
         "RecurringScheduleCron": {
-            "Description": "Cron expression for scheduling the Security Hub. Default: Every Monday 8:00 AM GMT",
-            "Default": "cron(0 0 0 * * ?)",
+            "Description": "Cron expression for scheduling the Security Hub.",
+            "Default": "cron(0 0 * * ? *)",
             "Type": "String"
         },
         "SentinelKeyARN":{
             "Description": "The ARN Sentinel Secret stored in the AWS secrets manager",
             "Type": "String",
             "AllowedPattern": "^arn:aws:secretsmanager:[a-zA-Z0-9\\-\\:]+"
-        }
         },
+		"checkTheRoleForLambdaExisting":{
+			"Type":"String",
+			"Description":"The template will create a role for lambda, you need to check the role existing or not, or the creation will fail.",
+			"AllowedValues": ["existing", "not_existing"],
+            "AllowedPattern": "(existing)|(not_existing)"
+		},
+        "existingRoleARNForLambda":{
+            "Description": "The ARN of existing role for lambda. If there is no role, then left it blank",
+            "Type": "String",
+            "AllowedPattern": "^arn:aws:iam[a-zA-Z0-9\\-\\:\\/]+"
+        }
+    },
     "Metadata": {
         "AWS::CloudFormation::Interface": {
             "ParameterGroups": [
@@ -22,15 +33,27 @@
                     },
                     "Parameters": [
                         "RecurringScheduleCron",
-                        "SentinelKeyARN"
+                        "SentinelKeyARN",
+						"checkTheRoleForLambdaExisting"
                     ]
                 }
             ],
             "ParameterLabels" : {
                 "RecurringScheduleCron": {"default": "CloudWatch Cron Expression"},
-                "SentinelKeyARN": {"default": "ARN of Sentinel Key stored in secrets manager"}
+                "SentinelKeyARN": {"default": "ARN of Sentinel Key stored in secrets manager"},
+                "checkTheRoleForLambdaExisting": {"default": "Check for the role for lambda existing or not"}
         }
     }},
+	"Conditions":{
+		"createRole":{
+			"Fn::Equals": [
+                {
+                    "Ref": "checkTheRoleForLambdaExisting"
+                },
+                "not_existing"
+            ]
+		}
+	},
     "Resources" : {
         "cloudWatchTriggerSecurityHubLambdaDaily": {
             "Type": "AWS::Events::Rule",
@@ -114,6 +137,7 @@
         },
         "RoleLambdaForSentinel": {
             "Type": "AWS::IAM::Role",
+			"Condition": "createRole",
             "Properties": {
               "RoleName":"RoleLambdaForSentinel",
               "AssumeRolePolicyDocument": {
@@ -157,10 +181,8 @@
                               "import json", 
                               "import boto3",
                               "def lambda_handler(event, context):", 
-                              {"Fn::Join":["", ["    response = client.get_secret_value(SecretId=')",{"Ref": "SentinelKeyARN"}, "'"]]},
-                              "def lambda_handler(event, context):", 
                               "    client = boto3.client('secretsmanager')",
-                              "    response = client.get_secret_value(SecretId='MyTestDatabaseSecret')",
+                              {"Fn::Join":["", ["    response = client.get_secret_value(SecretId='",{"Ref": "SentinelKeyARN"}, "')"]]},
                               "    result = json.loads(response['SecretString'])",
                               "    customer_id = result['workspaceID']",
                               "    shared_key  = result['primaryKey']",
@@ -177,14 +199,15 @@
                 "MemorySize": 256,
                 "Runtime": "python3.7",
                 "Timeout": "300",
-                "Role": {
-                    "Fn::GetAtt": [
-                        "RoleLambdaForSentinel",
-                        "Arn"
-                    ]
-                }
-            }
-        },
+                "Role": 
+					{
+					  "Fn::If" : [
+						"createRole",
+						{"Fn::GetAtt": [ "RoleLambdaForSentinel", "Arn" ]},
+						{"Ref" : "existingRoleARNForLambda"}
+					  ]
+					}
+			}},
         "lambdaSendGuardDutyFindingToSentinel": {
             "Type": "AWS::Lambda::Function",
             "Properties": {
@@ -195,17 +218,60 @@
                             [
                               "import json", 
                               "import boto3",
+                              "import datetime",
+                              "import hashlib",
+                              "import hmac",
+                              "import base64",
+                              "import urllib3.poolmanager",
+                              "# offical tutor: https://docs.microsoft.com/en-us/azure/azure-monitor/logs/data-collector-api",
+                              "# customer_id is workspace id, shared_key is primary key",
+                              "def build_signature(customer_id, shared_key, date, content_length, method, content_type, resource):",
+                              "    x_headers = 'x-ms-date:' + date",
+                              "    string_to_hash = method + '\\n' + str(content_length) + '\\n' + content_type + '\\n' + x_headers + '\\n' + resource",
+                              "    bytes_to_hash = bytes(string_to_hash, encoding='utf-8')",
+                              "    decoded_key = base64.b64decode(shared_key)",
+                              "    encoded_hash = base64.b64encode(hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()).decode()",
+                              "    authorization = 'SharedKey {}:{}'.format(customer_id,encoded_hash)",
+                              "    return authorization",
+                              
+                              "# Build and send a request to the POST API",
+                              "def post_data(customer_id, shared_key, body, log_type):",
+                              "    method = 'POST'",
+                              "    content_type = 'application/json'",
+                              "    resource = '/api/logs'",
+                              "    rfc1123date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')",
+                              "    content_length = len(body)",
+                              "    signature = build_signature(customer_id, shared_key, rfc1123date, content_length, method, content_type, resource)",
+                              "    uri = 'https://' + customer_id + '.ods.opinsights.azure.com' + resource + '?api-version=2016-04-01'",
+                              
+                              "    headers = {",
+                              "        'content-type': content_type,",
+                              "        'Authorization': signature,",
+                              "        'Log-Type': log_type,",
+                              "        'x-ms-date': rfc1123date",
+                              "    }",
+                              "    http = urllib3.PoolManager()",
+                              "    r = http.request(",
+                              "        'POST',",
+                              "        uri,",
+                              "        body=body,",
+                              "        headers=headers)",
+                              "    #response = requests.post(uri,data=body, headers=headers)",
+                              "    if (r.status >= 200 and r.status <= 299):",
+                              "        return 'Accepted'",
+                              "    else:",
+                              "        return 'Response code: {}'.format(r.status_code)",
                               "def lambda_handler(event, context):", 
-                              {"Fn::Join":["", ["    response = client.get_secret_value(SecretId=')",{"Ref": "SentinelKeyARN"}, "'"]]},
-                              "def lambda_handler(event, context):", 
-                              "    client = boto3.client('secretsmanager')",
-                              "    response = client.get_secret_value(SecretId='MyTestDatabaseSecret')",
-                              "    result = json.loads(response['SecretString'])",
-                              "    customer_id = result['workspaceID']",
-                              "    shared_key  = result['primaryKey']",
+                              "    client = boto3.client('secretsmanager')", {"Fn::Join":["", ["    response = client.get_secret_value(SecretId='",{"Ref": "SentinelKeyARN"}, "')"]]},
+                              "    secret = json.loads(response['SecretString'])",
+                              "    customer_id = secret['workspaceID']",
+                              "    shared_key  = secret['primaryKey']",
+                              "    log_type = 'guardduty'",
+                              "    body = json.dumps(event)",
+                              "    result = post_data(customer_id, shared_key, body, log_type)",
                               "    return {",     
                               "    'statusCode': 200,",         
-                              "    'body': json.dumps(response['SecretString'])",         
+                              "    'body': json.dumps(result)",         
                               "    }"
                             ]
                         ]
@@ -216,12 +282,15 @@
                 "MemorySize": 256,
                 "Runtime": "python3.7",
                 "Timeout": "300",
-                "Role": {
-                    "Fn::GetAtt": [
-                        "RoleLambdaForSentinel",
-                        "Arn"
-                    ]
-                }
+                "Role": 
+					{
+					  "Fn::If" : [
+						"createRole",
+						{"Fn::GetAtt": [ "RoleLambdaForSentinel", "Arn" ]},
+						{"Ref" : "existingRoleARNForLambda"}
+					  ]
+					}
+
             }
         }
     }
