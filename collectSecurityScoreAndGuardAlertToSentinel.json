@@ -3,8 +3,8 @@
     "Description": "Excution order:1. create the role for lambda 2. create the KMS and assign permission for the lambda role 3. run the cloudformatoin command runner to get the encrypt key 4. using Fn::GetAtt: to get the encrypted key and place in the lambda function code 5. create lambda function 6. create cloudwatch rule",
     "Parameters": {
         "RecurringScheduleCron": {
-            "Description": "Cron expression for scheduling the Security Hub summary email. Default: Every Monday 8:00 AM GMT. Example: Every Friday 9:00 AM GMT: cron(0 9 ? * 6 *)",
-            "Default": "cron(0 8 ? * 2 *)",
+            "Description": "Cron expression for scheduling the Security Hub. Default: Every Monday 8:00 AM GMT",
+            "Default": "cron(0 0 0 * * ?)",
             "Type": "String"
         },
         "SentinelKeyARN":{
@@ -136,7 +136,7 @@
                             "secretsmanager:DescribeSecret",
                             "secretsmanager:ListSecretVersionIds"
                         ],
-                        "Resource": "arn:aws:secretsmanager:ap-northeast-1:697172517517:secret:MyTestDatabaseSecret-YH30Bm"
+                        "Resource": {"Ref": "SentinelKeyARN"}
                   }
                 ]
                 }
@@ -155,10 +155,15 @@
                             "\n",
                             [
                               "import json", 
-                              {"Fn::Join":["", ["keyArn='",{"Ref": "SentinelKeyARN"}, "'"]]},
+                              "import boto3",
+                              "def lambda_handler(event, context):", 
+                              {"Fn::Join":["", ["    response = client.get_secret_value(SecretId=')",{"Ref": "SentinelKeyARN"}, "'"]]},
                               "def lambda_handler(event, context):", 
                               "    client = boto3.client('secretsmanager')",
                               "    response = client.get_secret_value(SecretId='MyTestDatabaseSecret')",
+                              "    result = json.loads(response['SecretString'])",
+                              "    customer_id = result['workspaceID']",
+                              "    shared_key  = result['primaryKey']",
                               "    return {",     
                               "    'statusCode': 200,",         
                               "    'body': json.dumps(response['SecretString'])",         
@@ -189,10 +194,15 @@
                             "\n",
                             [
                               "import json", 
-                              {"Fn::Join":["", ["keyArn='",{"Ref": "SentinelKeyARN"}, "'"]]},
+                              "import boto3",
+                              "def lambda_handler(event, context):", 
+                              {"Fn::Join":["", ["    response = client.get_secret_value(SecretId=')",{"Ref": "SentinelKeyARN"}, "'"]]},
                               "def lambda_handler(event, context):", 
                               "    client = boto3.client('secretsmanager')",
                               "    response = client.get_secret_value(SecretId='MyTestDatabaseSecret')",
+                              "    result = json.loads(response['SecretString'])",
+                              "    customer_id = result['workspaceID']",
+                              "    shared_key  = result['primaryKey']",
                               "    return {",     
                               "    'statusCode': 200,",         
                               "    'body': json.dumps(response['SecretString'])",         
